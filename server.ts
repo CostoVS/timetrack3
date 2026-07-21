@@ -1,4 +1,5 @@
 import 'dotenv/config';
+process.env.TZ = 'Africa/Johannesburg';
 import express from 'express';
 import cors from 'cors';
 import sqlite3 from 'sqlite3';
@@ -187,6 +188,7 @@ async function startServer() {
 
     await initializeDatabase(db, isPostgres);
     console.log('[DB] Initialization complete');
+    await recalibrateAllSessions();
   } catch (err) {
     console.error('[DB] FATAL ERROR during database initialization:', err);
     if (isPostgres) {
@@ -381,7 +383,11 @@ async function startServer() {
 
   router.get('/sessions', async (req, res) => {
     const sessions = await db.all('SELECT * FROM sessions ORDER BY date DESC, id DESC');
-    res.json(sessions);
+    const processed = sessions.map(s => ({
+      ...s,
+      total_hours: calculateHours(s)
+    }));
+    res.json(processed);
   });
 
   router.get('/sessions/current', async (req, res) => {
@@ -617,22 +623,63 @@ async function startServer() {
     return statuses[action] || 'working';
   }
 
-  function calculateHours(s: any) {
-    if (s.leave_type) return s.leave_hours || 0;
-    if (!s.clock_in || !s.clock_out) return 0;
-    const start = new Date(s.clock_in).getTime();
-    const end = new Date(s.clock_out).getTime();
-    let duration = end - start;
+  function parseToTimestamp(val: string | null | undefined, sessionDate?: string): number | null {
+    if (!val) return null;
+    let str = String(val).trim();
+    if (!str) return null;
 
-    // Deduct lunch
-    if (s.lunch_out && s.lunch_in) {
-      const lStart = new Date(s.lunch_out).getTime();
-      const lEnd = new Date(s.lunch_in).getTime();
-      duration -= (lEnd - lStart);
+    // Handle time-only string e.g. "10:17" or "10:17:00"
+    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(str)) {
+      const dStr = sessionDate || new Date().toISOString().split('T')[0];
+      str = `${dStr}T${str.length === 5 ? str + ':00' : str}`;
     }
 
-    // Tea breaks are NOT deducted as per user request
-    return Math.max(0, duration / (1000 * 60 * 60)); // Convert to hours
+    // Replace space with T e.g. "2026-07-21 10:17:00"
+    if (str.includes(' ') && !str.includes('T')) {
+      str = str.replace(' ', 'T');
+    }
+
+    const d = new Date(str);
+    if (isNaN(d.getTime())) return null;
+    return d.getTime();
+  }
+
+  function calculateHours(s: any) {
+    if (s.leave_type) return Number(s.leave_hours) || 0;
+    if (!s.clock_in || !s.clock_out) return 0;
+
+    const start = parseToTimestamp(s.clock_in, s.date);
+    const end = parseToTimestamp(s.clock_out, s.date);
+    if (start === null || end === null || end <= start) return 0;
+
+    let duration = end - start;
+
+    // Deduct lunch break
+    if (s.lunch_out && s.lunch_in) {
+      const lStart = parseToTimestamp(s.lunch_out, s.date);
+      const lEnd = parseToTimestamp(s.lunch_in, s.date);
+      if (lStart !== null && lEnd !== null && lEnd > lStart) {
+        duration -= (lEnd - lStart);
+      }
+    }
+
+    const hours = duration / (1000 * 60 * 60);
+    return Math.max(0, Math.round(hours * 100) / 100);
+  }
+
+  async function recalibrateAllSessions() {
+    try {
+      const all = await db.all('SELECT * FROM sessions');
+      for (const s of all) {
+        const computed = calculateHours(s);
+        if (Math.abs((s.total_hours || 0) - computed) > 0.001) {
+          console.log(`[RECALIBRATE] Session ID ${s.id} (${s.date}): Updating total_hours from ${s.total_hours} -> ${computed}`);
+          await db.run('UPDATE sessions SET total_hours = ? WHERE id = ?', [computed, s.id]);
+        }
+      }
+    } catch (err) {
+      console.error('[RECALIBRATE ERROR]', err);
+    }
   }
 
   // Vite middleware for development
