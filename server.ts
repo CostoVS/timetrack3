@@ -623,47 +623,90 @@ async function startServer() {
     return statuses[action] || 'working';
   }
 
-  function parseToTimestamp(val: string | null | undefined, sessionDate?: string): number | null {
+  function getWallClockMinutes(val: string | null | undefined): number | null {
     if (!val) return null;
-    let str = String(val).trim();
+    const str = String(val).trim();
     if (!str) return null;
 
-    // Handle time-only string e.g. "10:17" or "10:17:00"
+    // Handle simple HH:mm or HH:mm:ss
     if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(str)) {
-      const dStr = sessionDate || new Date().toISOString().split('T')[0];
-      str = `${dStr}T${str.length === 5 ? str + ':00' : str}`;
+      const parts = str.split(':');
+      return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
     }
 
-    // Replace space with T e.g. "2026-07-21 10:17:00"
-    if (str.includes(' ') && !str.includes('T')) {
-      str = str.replace(' ', 'T');
+    // Handle ISO strings with 'T'
+    if (str.includes('T')) {
+      if (str.includes('Z') || /[+-]\d{2}:\d{2}$/.test(str)) {
+        const d = new Date(str);
+        if (isNaN(d.getTime())) return null;
+        try {
+          const formatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'Africa/Johannesburg',
+            hour: 'numeric',
+            minute: 'numeric',
+            hour12: false
+          });
+          const parts = formatter.formatToParts(d);
+          let h = 0, m = 0;
+          for (const p of parts) {
+            if (p.type === 'hour') h = parseInt(p.value, 10) % 24;
+            if (p.type === 'minute') m = parseInt(p.value, 10);
+          }
+          return h * 60 + m;
+        } catch {
+          return d.getUTCHours() * 60 + d.getUTCMinutes();
+        }
+      } else {
+        const timePart = str.split('T')[1];
+        if (timePart) {
+          const parts = timePart.split(':');
+          return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+        }
+      }
+    }
+
+    if (str.includes(' ')) {
+      const timePart = str.split(' ')[1];
+      if (timePart) {
+        const parts = timePart.split(':');
+        return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+      }
     }
 
     const d = new Date(str);
-    if (isNaN(d.getTime())) return null;
-    return d.getTime();
+    if (!isNaN(d.getTime())) {
+      return d.getHours() * 60 + d.getMinutes();
+    }
+
+    return null;
   }
 
   function calculateHours(s: any) {
     if (s.leave_type) return Number(s.leave_hours) || 0;
     if (!s.clock_in || !s.clock_out) return 0;
 
-    const start = parseToTimestamp(s.clock_in, s.date);
-    const end = parseToTimestamp(s.clock_out, s.date);
-    if (start === null || end === null || end <= start) return 0;
+    const startMin = getWallClockMinutes(s.clock_in);
+    const endMin = getWallClockMinutes(s.clock_out);
 
-    let duration = end - start;
+    if (startMin === null || endMin === null) return 0;
+
+    let durationMin = endMin - startMin;
+    if (durationMin < 0) {
+      durationMin += 24 * 60; // Overnight shift
+    }
 
     // Deduct lunch break
     if (s.lunch_out && s.lunch_in) {
-      const lStart = parseToTimestamp(s.lunch_out, s.date);
-      const lEnd = parseToTimestamp(s.lunch_in, s.date);
-      if (lStart !== null && lEnd !== null && lEnd > lStart) {
-        duration -= (lEnd - lStart);
+      const lStart = getWallClockMinutes(s.lunch_out);
+      const lEnd = getWallClockMinutes(s.lunch_in);
+      if (lStart !== null && lEnd !== null) {
+        let lDuration = lEnd - lStart;
+        if (lDuration < 0) lDuration += 24 * 60;
+        durationMin -= lDuration;
       }
     }
 
-    const hours = duration / (1000 * 60 * 60);
+    const hours = durationMin / 60;
     return Math.max(0, Math.round(hours * 100) / 100);
   }
 
